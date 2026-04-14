@@ -1,252 +1,232 @@
+/* tinybasic.c - Intérprete BASIC C89 completo para cc65/6502 */
+/* Guardar como: src/main.c */
 #include <stdint.h>
-#include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
-#include "romapi.h"
 
-/* Ajuste a 7200 para solucionar el desbordamiento de 91 bytes */
-#define PROG_SIZE   7200  
+/* === TIPOS EXPLÍCITOS === */
+typedef unsigned char u8;
+typedef unsigned int  u16;
+typedef signed int    s16;
+
+/* === PUNTEROS DIRECTOS A ROM API (Evita macros rotos de romapi.h) === */
+static void  (*rom_putc)(char)    = (void (*)(char))0xBF18;
+static char  (*rom_getc)(void)    = (char (*)(void))0xBF1B;
+static u8    (*rom_rx_ready)(void)= (u8 (*)(void))0xBF21;
+static void  (*rom_delay)(u16)    = (void (*)(u16))0xBF33;
+
+/* === CONFIGURACIÓN === */
+#define PROG_SIZE   7500  /* ~7.3 KB: máximo seguro sin overflow de BSS */
 #define VAR_COUNT   26
+#define LED_PORT    (*(volatile u8*)0xC001)
+#define LED_CONF    (*(volatile u8*)0xC003)
 
-/* --- Registros Hardware Nexys --- */
-#define PORT_SALIDA_LED      (*(volatile uint8_t*)0xC001)
-#define CONF_PORT_SALIDA_LED (*(volatile uint8_t*)0xC003)
+/* === ESTADO GLOBAL === */
+static s16 vars[VAR_COUNT];
+static char prog[PROG_SIZE];
+static char *tp;
+static char *cur_line;
+static volatile u8 running;
+static u8 do_goto;
+static u16 current_line_num;
+static u8 run_abort;
 
-static int  variables[VAR_COUNT];
-static char program[PROG_SIZE];
-static char *txtpos;
-static char *current_line_ptr; 
-static int  is_running_prog = 0; 
-static int  running = 1;
-static int  temp_wait;
-
-/* --- Helpers E/S --- */
-void out_char(char c) { if (c == '\n') rom_uart_putc('\r'); rom_uart_putc(c); }
-void out_str(const char *s) { while (*s) out_char(*s++); }
-void out_num(int n) {
-    char b[7]; int i = 0;
-    if (n == 0) { out_char('0'); return; }
-    if (n < 0) { out_char('-'); n = -n; }
-    while (n > 0) { b[i++] = (n % 10) + '0'; n /= 10; }
-    while (i > 0) out_char(b[--i]);
-}
-char in_char(void) { while (!rom_uart_rx_ready()); return rom_uart_getc(); }
-void do_wait(int ms) {
-    temp_wait = ms;
-    __asm__ ("ldy %v+1", temp_wait); 
-    __asm__ ("lda %v", temp_wait);   
-    __asm__ ("jsr $BF33"); 
+/* === HELPERS === */
+static u8 my_strlen(const char *s) {
+    u8 n = 0; while (*s++) n++; return n;
 }
 
-/* --- Parser Aritmético Recursivo --- */
-static void ignore_spaces(void) { while (*txtpos == ' ') txtpos++; }
-static int expression(void);
+static void my_memmove(char *dst, const char *src, u16 n) {
+    if (dst < src) while (n--) *dst++ = *src++;
+    else { dst += n; src += n; while (n--) *--dst = *--src; }
+}
 
-static int factor(void) {
-    int val = 0; int sign = 1;
-    ignore_spaces();
-    if (*txtpos == '-') { sign = -1; txtpos++; ignore_spaces(); }
-    
-    if (strncmp(txtpos, "PEEK", 4) == 0) {
-        txtpos += 4; ignore_spaces();
-        if (*txtpos != '(') {
-            out_str("\r\nSYNTAX ERR: PEEK EXPECTS (\r\n");
-            is_running_prog = 0; return 0;
+static u16 parse_linenum(const char *s) {
+    u16 v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+    return v;
+}
+
+static u8 match_cmd(const char *cmd, u8 len) {
+    u8 i;
+    for (i = 0; i < len; i++) if (tp[i] != cmd[i]) return 0;
+    { char c = tp[len]; return (c == '\0' || c == ' ' || c == '\r' || c == '\n'); }
+}
+
+/* === E/S SEGURA === */
+static void outc(char c) { if (c == '\n') rom_putc('\r'); rom_putc(c); }
+static void outs(const char *s) { while (*s) rom_putc(*s++); }
+
+static void outn(s16 n) {
+    char buf[7]; u8 i = 0;
+    if (n < 0) { rom_putc('-'); n = -n; }
+    if (n == 0) rom_putc('0');
+    else {
+        while (n > 0) { buf[i++] = (char)(n % 10 + '0'); n /= 10; }
+        while (i > 0) rom_putc(buf[--i]);
+    }
+}
+
+static u8 inc_u8(void) { while (!rom_rx_ready()); return (u8)rom_getc(); }
+static void wait_ms(u16 ms) { rom_delay(ms); }
+
+/* === PARSER === */
+static void skip(void) { while (*tp == ' ') tp++; }
+static s16 expr(void);
+
+static s16 factor(void) {
+    s16 v = 0; s16 sign = 1; s16 addr;
+    skip();
+    if (*tp == '-') { sign = -1; tp++; skip(); }
+    if (*tp == '(') { tp++; v = expr(); skip(); if (*tp == ')') tp++; }
+    else if (*tp >= 'A' && *tp <= 'Z') v = vars[*tp++ - 'A'];
+    else if (*tp >= '0' && *tp <= '9') {
+        while (*tp >= '0' && *tp <= '9') v = v * 10 + (*tp++ - '0');
+    } else if (tp[0]=='P' && tp[1]=='E' && tp[2]=='E' && tp[3]=='K' && tp[4]=='(') {
+        tp += 5; addr = expr(); skip();
+        if (*tp == ')') { tp++; v = *(volatile signed char*)(u16)addr; }
+    }
+    return v * sign;
+}
+
+static s16 term(void) {
+    s16 a; char op; s16 b;
+    a = factor(); skip();
+    while (*tp == '*' || *tp == '/' || *tp == '%') {
+        op = *tp++; b = factor(); skip();
+        if (op == '*') a *= b; else if (op == '/') a = b ? a / b : 0; else a = b ? a % b : 0;
+    }
+    return a;
+}
+
+static s16 expr(void) {
+    s16 a; char op; s16 b;
+    a = term(); skip();
+    while (*tp == '+' || *tp == '-') {
+        op = *tp++; b = term(); skip(); a = (op == '+') ? a + b : a - b;
+    }
+    return a;
+}
+
+/* === MOTOR DE EJECUCIÓN === */
+static void exec_stmt(void);
+
+static void exec_stmt(void) {
+    s16 a, res, n, addr; u8 vi, i; char buf[8]; char *s, *p, *save; u16 target;
+
+    skip();
+    if (!*tp || *tp == '\r' || *tp == '\n') return;
+
+    if (match_cmd("PRINT", 5)) {
+        tp += 5; skip();
+        if (*tp == '"') { tp++; while (*tp && *tp != '"') outc(*tp++); if (*tp == '"') tp++; }
+        else outn(expr());
+        outs("\r\n"); return;
+    }
+    if (match_cmd("IF", 2)) {
+        tp += 2; a = expr(); res = 0; skip();
+        if (tp[0]=='=' && tp[1]=='=') { tp += 2; res = (a == expr()); }
+        else if (*tp == '=') { tp++; res = (a == expr()); }
+        else if (*tp == '>') { tp++; res = (a > expr()); }
+        else if (*tp == '<') { tp++; res = (a < expr()); }
+        skip();
+        if (match_cmd("THEN", 4)) {
+            tp += 4; skip(); if (res) exec_stmt(); else { while (*tp && *tp != '\r' && *tp != '\n') tp++; }
         }
-        txtpos++; val = expression(); ignore_spaces();
-        if (*txtpos == ')') {
-            txtpos++;
-        } else {
-            out_str("\r\nSYNTAX ERR: PEEK EXPECTS )\r\n");
-            is_running_prog = 0; return 0;
-        }
-        return (int)(*(volatile uint8_t*)(uint16_t)val);
+        return;
     }
-
-    if (*txtpos == '(') {
-        txtpos++; val = expression(); ignore_spaces();
-        if (*txtpos == ')') txtpos++;
-        return val * sign;
+    if (match_cmd("GOTO", 4)) {
+        tp += 4; skip(); target = (u16)expr(); p = prog;
+        while (*p) { if (*p >= '0' && *p <= '9' && parse_linenum(p) == target) { cur_line = p; do_goto = 1; return; } p += my_strlen(p) + 1; }
+        outs("LINE NOT FOUND\r\n"); run_abort = 1; return;
     }
-    if (isdigit(*txtpos)) { 
-        while (isdigit(*txtpos)) val = val * 10 + (*txtpos++ - '0'); 
-    } else if (*txtpos >= 'A' && *txtpos <= 'Z') { 
-        val = variables[*txtpos++ - 'A']; 
-    }
-    return val * sign;
-}
-
-static int term(void) {
-    int t1 = factor(); ignore_spaces();
-    while (*txtpos == '*' || *txtpos == '/' || *txtpos == '%') {
-        char op = *txtpos++; int t2 = factor();
-        if (op == '*') t1 *= t2;
-        else if (op == '/') { if (t2 != 0) t1 /= t2; else out_str("DIV0 ERR\r\n"); }
-        else if (op == '%') { if (t2 != 0) t1 %= t2; }
-        ignore_spaces();
-    }
-    return t1;
-}
-
-static int expression(void) {
-    int t1 = term(); ignore_spaces();
-    while (*txtpos == '+' || *txtpos == '-') {
-        char op = *txtpos++; int t2 = term();
-        if (op == '+') t1 += t2; else t1 -= t2;
-        ignore_spaces();
-    }
-    return t1;
-}
-
-/* --- Motor de Comandos --- */
-void execute_statement(void) {
-    int var_idx, res, v1, target, addr;
-    char *p;
-    ignore_spaces();
-    if (*txtpos == '\0' || *txtpos == '\n' || *txtpos == '\r') return;
-
-    if (strncmp(txtpos, "FREE", 4) == 0) {
-        p = program; v1 = 0;
-        while (*p) { v1 += (strlen(p) + 1); p += (strlen(p) + 1); }
-        out_num(PROG_SIZE - v1); out_str(" BYTES FREE\r\n");
-    }
-    else if (strncmp(txtpos, "NEW", 3) == 0) { memset(program, 0, PROG_SIZE); out_str("OK\r\n"); }
-    else if (strncmp(txtpos, "QUIT", 4) == 0) { out_str("BYE\r\n"); running = 0; __asm__ ("jmp $B000"); }
-    else if (strncmp(txtpos, "PRINT", 5) == 0) {
-        txtpos += 5; ignore_spaces();
-        if (*txtpos == '"') {
-            txtpos++; while (*txtpos && *txtpos != '"') out_char(*txtpos++);
-            if (*txtpos == '"') txtpos++;
-        } else out_num(expression());
-        out_str("\r\n");
-    }
-    else if (strncmp(txtpos, "INPUT", 5) == 0) {
-        char buf[16]; int idx = 0;
-        txtpos += 5; ignore_spaces();
-        if (*txtpos >= 'A' && *txtpos <= 'Z') {
-            var_idx = *txtpos++ - 'A'; out_str("? ");
+    if (match_cmd("INPUT", 5)) {
+        tp += 5; skip();
+        if (*tp >= 'A' && *tp <= 'Z') {
+            vi = (u8)(*tp++ - 'A'); i = 0; outs("? ");
             while (1) {
-                char c = in_char();
-                if (c == '\r') { out_str("\r\n"); break; }
-                if (c == 0x08 && idx > 0) { idx--; out_str("\b \b"); }
-                else if ((isdigit(c) || (c == '-' && idx == 0)) && idx < 15) { buf[idx++] = c; out_char(c); }
+                u8 c = inc_u8(); if (c == '\r' || c == '\n') { outs("\r\n"); break; }
+                if (c == 0x08 || c == 0x7F) { if (i > 0) { i--; outs("\b \b"); } }
+                else if ((c >= '0' && c <= '9') || (c == '-' && i == 0)) { if (i < 7) { buf[i++] = (char)c; outc((char)c); } }
             }
-            buf[idx] = '\0'; variables[var_idx] = atoi(buf);
+            buf[i] = '\0'; n = 0; s = buf; if (*s == '-') { n = -1; s++; }
+            while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0'); vars[vi] = n;
         }
+        return;
     }
-    else if (strncmp(txtpos, "LEDS", 4) == 0) { txtpos += 4; ignore_spaces(); PORT_SALIDA_LED = (uint8_t)expression(); }
-    else if (strncmp(txtpos, "POKE", 4) == 0) {
-        txtpos += 4; ignore_spaces();
-        addr = (uint16_t)expression(); 
-        ignore_spaces(); if (*txtpos == ',') txtpos++;
-        v1 = expression();
-        *(volatile uint8_t*)(uint16_t)addr = (uint8_t)v1;
+    if (match_cmd("LEDS", 4)) { tp += 4; skip(); LED_PORT = (u8)expr(); return; }
+    if (match_cmd("POKE", 4)) { tp += 4; skip(); addr = (u16)expr(); skip(); if (*tp == ',') tp++; *(volatile u8*)addr = (u8)expr(); return; }
+    if (match_cmd("WAIT", 4)) {
+        tp += 4; skip();
+        if (*tp == '\r' || *tp == '\n') { outs("WAIT EXPECTS ARG\r\n"); run_abort = 1; return; }
+        wait_ms((u16)expr()); return;
     }
-    else if (strncmp(txtpos, "WAIT", 4) == 0) { txtpos += 4; ignore_spaces(); do_wait(expression()); }
-    else if (strncmp(txtpos, "GET", 3) == 0) {
-        txtpos += 3; ignore_spaces();
-        if (*txtpos >= 'A' && *txtpos <= 'Z') {
-            var_idx = *txtpos++ - 'A';
-            variables[var_idx] = rom_uart_rx_ready() ? (int)rom_uart_getc() : 0;
-        }
+    if (match_cmd("GET", 3)) { tp += 3; skip(); if (*tp >= 'A' && *tp <= 'Z') vars[*tp++ - 'A'] = rom_rx_ready() ? (s16)rom_getc() : 0; return; }
+    if (match_cmd("FREE", 4)) { u16 used = 0; p = prog; while (*p) { used += my_strlen(p) + 1; p += my_strlen(p) + 1; } outn((s16)(PROG_SIZE - used)); outs(" BYTES FREE\r\n"); return; }
+    if (match_cmd("NEW", 3)) { prog[0] = '\0'; outs("OK\r\n"); return; }
+    if (match_cmd("LIST", 4)) { p = prog; while (*p) { outs(p); outs("\r\n"); p += my_strlen(p) + 1; } return; }
+    if (match_cmd("QUIT", 4)) { outs("BYE\r\n"); running = 0; asm("JMP $8000"); return; }
+
+    /* ASIGNACIÓN */
+    if (match_cmd("LET", 3)) { tp += 3; skip(); }
+    if (*tp >= 'A' && *tp <= 'Z') {
+        save = tp; vi = (u8)(*tp++ - 'A'); skip();
+        if (*tp == '=') { tp++; vars[vi] = expr(); return; }
+        tp = save;
     }
-    else if (strncmp(txtpos, "IF", 2) == 0) {
-        txtpos += 2; v1 = expression(); ignore_spaces();
-        res = 0;
-        if (txtpos[0] == '=' && txtpos[1] == '=') { txtpos += 2; res = (v1 == expression()); }
-        else if (*txtpos == '=') { txtpos++; res = (v1 == expression()); }
-        else if (*txtpos == '>') { txtpos++; res = (v1 > expression()); }
-        else if (*txtpos == '<') { txtpos++; res = (v1 < expression()); }
-        ignore_spaces();
-        if (strncmp(txtpos, "THEN", 4) == 0) { 
-            txtpos += 4; ignore_spaces();
-            if (res) { execute_statement(); return; }
-            else { while (*txtpos && *txtpos != '\r' && *txtpos != '\n') txtpos++; }
-        }
-    }
-    else if (strncmp(txtpos, "GOTO", 4) == 0) {
-        txtpos += 4; ignore_spaces();
-        target = expression(); p = program;
-        while (*p) {
-            char *ps = p; while (*ps == ' ') ps++;
-            if (isdigit(*ps) && atoi(ps) == target) { current_line_ptr = p; is_running_prog = 2; return; }
-            p += strlen(p) + 1;
-        }
-        out_str("LINE NOT FOUND\r\n"); is_running_prog = 0;
-    }
-    else if (strncmp(txtpos, "LET", 3) == 0 || (*txtpos >= 'A' && *txtpos <= 'Z')) {
-        if (strncmp(txtpos, "LET", 3) == 0) txtpos += 3;
-        ignore_spaces();
-        if (*txtpos >= 'A' && *txtpos <= 'Z') {
-            var_idx = *txtpos++ - 'A'; ignore_spaces();
-            if (*txtpos == '=') { txtpos++; variables[var_idx] = expression(); }
-        }
-    } 
-    else { 
-        out_str("UNKNOWN COMMAND: ");
-        p = txtpos; for(v1=0; v1<10 && *p >= ' '; v1++) out_char(*p++); 
-        out_str("\r\n"); is_running_prog = 0; 
-    }
+
+    /* ERROR */
+    outs("SYNTAX ERROR IN LINE "); outn(current_line_num); outs("\r\n");
+    run_abort = 1;
 }
 
-/* --- Gestión de Programa --- */
-void add_line(int num, char *full_line) {
-    char *p = program; char *insert_pos = NULL; char *abs_end, *next, *prog_end, *check;
-    int line_len = (int)strlen(full_line) + 1;
-    p = program;
+/* === GESTIÓN DE LÍNEAS === */
+static void add_line(u16 num, const char *line) {
+    u8 len; char *p, *ins, *end, *next;
+    len = my_strlen(line) + 1; p = prog; ins = 0;
     while (*p) {
-        if (atoi(p) == num) {
-            next = p + strlen(p) + 1; abs_end = program;
-            while (*abs_end) abs_end += strlen(abs_end) + 1;
-            abs_end++; memmove(p, next, (size_t)(abs_end - next));
-            p = program; continue;
-        }
-        p += strlen(p) + 1;
+        if (parse_linenum(p) == num) { next = p + my_strlen(p) + 1; end = prog; while (*end) end += my_strlen(end) + 1; end++; my_memmove(p, next, (u16)(end - next)); p = prog; continue; }
+        p += my_strlen(p) + 1;
     }
-    check = full_line; while (isdigit(*check)) check++; while (*check == ' ') check++;
-    if (*check == '\0') return;
-    p = program;
-    while (*p) { if (atoi(p) > num) { insert_pos = p; break; } p += strlen(p) + 1; }
-    if (insert_pos == NULL) insert_pos = p;
-    prog_end = program; while (*prog_end) prog_end += strlen(prog_end) + 1;
-    if ((prog_end - program) + line_len >= PROG_SIZE) { out_str("MEM FULL\r\n"); return; }
-    memmove(insert_pos + line_len, insert_pos, (size_t)(prog_end - insert_pos + 1));
-    memcpy(insert_pos, full_line, (size_t)line_len);
+    p = prog; while (*p) { if (parse_linenum(p) > num) { ins = p; break; } p += my_strlen(p) + 1; }
+    if (!ins) ins = p;
+    end = prog; while (*end) end += my_strlen(end) + 1;
+    if ((u16)(end - prog) + len >= PROG_SIZE) { outs("MEM FULL\r\n"); return; }
+    my_memmove(ins + len, ins, (u16)(end - ins + 1));
+    { u8 i; for (i = 0; i < len; i++) ins[i] = line[i]; }
 }
 
+/* === MAIN === */
 int main(void) {
-    char input_line[64]; uint8_t i;
-    CONF_PORT_SALIDA_LED = 0xC0; PORT_SALIDA_LED = 0x00;
-    memset(program, 0, PROG_SIZE);
-    for(i=0; i<VAR_COUNT; i++) variables[i] = 0;
-    running = 1;
-    out_str("\r\n6502 TINY BASIC V3.5.6\r\nREADY\r\n");
+    u8 i; char line[64]; u8 idx; char c;
+    LED_CONF = 0xC0; LED_PORT = 0x00;
+    prog[0] = '\0'; for (i = 0; i < VAR_COUNT; i++) vars[i] = 0;
+    running = 1; current_line_num = 0; run_abort = 0;
+    outs("\r\n6502 TINY BASIC V5.0 (LINE TRACK)\r\nREADY\r\n");
+
     while (running) {
-        out_str("> "); i = 0;
+        outs("> "); idx = 0;
         while (1) {
-            char c = in_char();
-            if (c == '\r') { input_line[i] = '\0'; out_str("\r\n"); break; }
-            if (c == 0x08 && i > 0) { i--; out_str("\b \b"); }
-            else if (i < 63) { input_line[i++] = (char)toupper((int)c); out_char(input_line[i-1]); }
+            c = (char)inc_u8();
+            if (c == '\r' || c == '\n') { line[idx] = '\0'; outs("\r\n"); break; }
+            if (c == 0x08 || c == 0x7F) { if (idx > 0) { idx--; outs("\b \b"); } }
+            else if (c >= 0x20 && c <= 0x7E) { if (idx < 63) { if (c >= 'a' && c <= 'z') c -= 32; line[idx] = c; outc(line[idx]); idx++; } }
         }
-        if (i == 0) continue;
-        txtpos = input_line;
-        if (isdigit(*txtpos)) add_line(atoi(txtpos), input_line);
-        else if (strcmp(input_line, "RUN") == 0) {
-            current_line_ptr = program; 
-            while (*current_line_ptr && running) {
-                is_running_prog = 1; txtpos = current_line_ptr;
-                while (isdigit(*txtpos)) txtpos++;
-                execute_statement();
-                if (is_running_prog == 2) continue;
-                if (is_running_prog == 0) break;
-                current_line_ptr += strlen(current_line_ptr) + 1;
+        if (idx == 0) continue;
+
+        tp = line;
+        if (*tp >= '0' && *tp <= '9') add_line(parse_linenum(tp), line);
+        else if (match_cmd("RUN", 3)) {
+            cur_line = prog; do_goto = 0; run_abort = 0;
+            while (*cur_line && running && !run_abort) {
+                current_line_num = parse_linenum(cur_line);
+                tp = cur_line; while (*tp >= '0' && *tp <= '9') tp++;
+                exec_stmt();
+                if (do_goto) { do_goto = 0; continue; }
+                if (run_abort) break;
+                cur_line += my_strlen(cur_line) + 1;
             }
-            is_running_prog = 0;
-        } else if (strcmp(input_line, "LIST") == 0) {
-            char *scan = program;
-            while (*scan) { out_str(scan); out_str("\r\n"); scan += strlen(scan) + 1; }
-        } else execute_statement();
+        } else {
+            current_line_num = 0;
+            exec_stmt();
+        }
     }
     return 0;
 }
